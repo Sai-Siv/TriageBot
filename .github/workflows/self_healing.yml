@@ -1,0 +1,118 @@
+# .github/workflows/self_healing.yml
+name: Reusable Self-Healing CI
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version to use'
+        required: false
+        type: string
+        default: '3.11'
+      test-command:
+        description: 'Command to run tests'
+        required: false
+        type: string
+        default: 'pytest -v'
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+      GROQ_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  test-and-heal:
+    if: "!contains(github.event.head_commit.message, '[ci-auto-fix]')"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Checkout self-healing agent
+        uses: actions/checkout@v4
+        with:
+          repository: Sai-Siv/TriageBot
+          path: .ci-agent
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+
+      - name: Install target repo dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Install agent dependencies
+        run: |
+          pip install -r .ci-agent/requirements.txt
+
+      - name: Run test suite
+        id: run_tests
+        run: |
+          set +e
+          set -o pipefail
+          ${{ inputs.test-command }} 2>&1 | tee build.log
+          TEST_EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=$TEST_EXIT_CODE" >> $GITHUB_OUTPUT
+          exit 0
+
+      - name: Upload build log
+        if: steps.run_tests.outputs.exit_code != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.sha }}
+          path: build.log
+          retention-days: 7
+
+      - name: Configure Git
+        if: steps.run_tests.outputs.exit_code != '0'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Run self-healing agent
+        if: steps.run_tests.outputs.exit_code != '0'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          echo "🤖 Starting self-healing agent..."
+          cd ${{ github.workspace }}
+          python .ci-agent/agent.py
+
+      - name: Push auto-fix commit
+        if: steps.run_tests.outputs.exit_code != '0'
+        run: |
+          if git log --oneline -1 | grep -q "\[ci-auto-fix\]"; then
+            echo "✅ Auto-fix commit detected, pushing..."
+            git push
+          else
+            echo "⚠️ No auto-fix commit was made"
+            exit 1
+          fi
+
+      - name: Verify fix
+        if: steps.run_tests.outputs.exit_code != '0'
+        run: |
+          echo "🧪 Running tests again to verify the fix..."
+          ${{ inputs.test-command }}
+
+      - name: Report status
+        if: always()
+        run: |
+          if [ "${{ steps.run_tests.outputs.exit_code }}" == "0" ]; then
+            echo "✅ Tests passed on first run"
+          else
+            echo "🔧 Tests failed, self-healing attempted"
+          fi
